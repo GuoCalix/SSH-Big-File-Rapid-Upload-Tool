@@ -84,6 +84,17 @@ class ScpGui:
         t.daemon = True
         t.start()
 
+    def find_default_keys(self):
+        """自动发现 ~/.ssh 目录下的默认私钥文件（模拟 ssh 命令行为）"""
+        ssh_dir = os.path.expanduser("~/.ssh")
+        default_key_names = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        found = []
+        for name in default_key_names:
+            path = os.path.join(ssh_dir, name)
+            if os.path.exists(path):
+                found.append(path)
+        return found
+
     def execute_upload(self):
         host_alias = self.host_combo.get()
         conf = self.hosts[host_alias]
@@ -102,38 +113,80 @@ class ScpGui:
         key_path = conf.get('identityfile')
         if key_path: key_path = os.path.expanduser(key_path)
 
+        connected = False
+
         try:
-            # 1. 尝试使用私钥连接 (如果 config 里有 IdentityFile 且文件存在)
+            # 1. 尝试使用 config 中显式指定的私钥
             if key_path and os.path.exists(key_path):
                 try:
                     ssh.connect(hostname, port=port, username=user, key_filename=key_path, timeout=10)
-                except (paramiko.PasswordRequiredException, paramiko.AuthenticationException):
-                    # 如果私钥需要密码或私钥失效，弹出密码框
-                    pwd = self.ask_password(f"服务器 {host_alias} 认证失败或私钥加密，请输入密码:")
-                    if not pwd: raise Exception("用户取消了密码输入")
-                    ssh.connect(hostname, port=port, username=user, password=pwd, key_filename=key_path)
-            else:
-                # 2. 如果没有私钥配置，直接请求手动输入密码
-                pwd = self.ask_password(f"未发现私钥。请输入 {user}@{host_alias} 的登录密码:")
-                if not pwd: raise Exception("未提供密码")
-                ssh.connect(hostname, port=port, username=user, password=pwd)
+                    connected = True
+                except paramiko.PasswordRequiredException:
+                    # 私钥有密码保护
+                    pwd = self.ask_password(f"私钥需要密码，请输入私钥密码:")
+                    if pwd:
+                        ssh.connect(hostname, port=port, username=user, password=pwd, key_filename=key_path, timeout=10)
+                        connected = True
+                except (paramiko.AuthenticationException, paramiko.SSHException):
+                    pass  # 显式密钥失败，继续尝试其他方式
+
+            # 2. 尝试使用 ~/.ssh 目录下的默认私钥（模拟 ssh 命令行为）
+            if not connected:
+                default_keys = self.find_default_keys()
+                for dk in default_keys:
+                    try:
+                        ssh.connect(hostname, port=port, username=user, key_filename=dk, timeout=10)
+                        connected = True
+                        break
+                    except paramiko.PasswordRequiredException:
+                        pwd = self.ask_password(f"私钥 {os.path.basename(dk)} 需要密码:")
+                        if pwd:
+                            try:
+                                ssh.connect(hostname, port=port, username=user, password=pwd, key_filename=dk, timeout=10)
+                                connected = True
+                                break
+                            except Exception:
+                                continue
+                    except (paramiko.AuthenticationException, paramiko.SSHException):
+                        continue
+
+            # 3. 最后才回退到密码认证
+            if not connected:
+                pwd = self.ask_password(f"密钥认证失败，请输入 {user}@{host_alias} 的登录密码:")
+                if not pwd:
+                    raise Exception("用户取消了密码输入")
+                ssh.connect(hostname, port=port, username=user, password=pwd, timeout=10)
 
             # 执行上传
-            with SCPClient(ssh.get_transport(), progress=self.progress_callback) as scp:
+            transport = ssh.get_transport()
+            if transport is None:
+                raise Exception("SSH 连接建立失败，无法获取传输通道")
+            
+            with SCPClient(transport, progress=self.progress_callback) as scp:
                 scp.put(local_file, remote_path)
             
             self.root.after(0, lambda: messagebox.showinfo("成功", "文件上传完成！"))
             self.root.after(0, lambda: self.status_label.config(text="完成", fg="green"))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("传输错误", str(e)))
+            err_msg = str(e) if str(e) else "连接失败，请检查网络和服务器配置"
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("传输错误", msg))
             self.root.after(0, lambda: self.status_label.config(text="失败", fg="red"))
         finally:
             ssh.close()
             self.root.after(0, lambda: self.upload_btn.config(state="normal"))
 
     def ask_password(self, prompt):
-        # 必须在主线程弹出对话框
-        return simpledialog.askstring("SSH 认证", prompt, show='*')
+        # 必须在主线程弹出对话框，使用 Event 同步
+        result = [None]
+        event = threading.Event()
+
+        def _ask():
+            result[0] = simpledialog.askstring("SSH 认证", prompt, show='*', parent=self.root)
+            event.set()
+
+        self.root.after(0, _ask)
+        event.wait()  # 阻塞后台线程，等待主线程完成对话框
+        return result[0]
 
 if __name__ == "__main__":
     root = tk.Tk()
